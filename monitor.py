@@ -37,7 +37,7 @@ def send_telegram(text, reply_id=None):
         data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
         if reply_id: data["reply_to_message_id"] = reply_id
         r = requests.post(url, json=data, timeout=30)
-        log(f"✅ Telegram: {r.status_code}")
+        log(f"✅ Telegram: {r.status_code} - {r.text[:100]}")
         return r.json()
     except Exception as e:
         log(f"❌ TELEGRAM FAILED: {type(e).__name__}: {e}")
@@ -54,7 +54,7 @@ def scrape_with_links(url):
     start = time.time()
     try:
         log(f"🔍 Scraping: {url[:60]}...")
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
         log(f"✅ HTTP OK ({r.status_code}) in {time.time()-start:.1f}s")
@@ -80,9 +80,69 @@ def scrape_with_links(url):
                         if len(items) >= MAX_ITEMS: break
             log(f"✅ RSS {src}: {len(items)} items")
         
-        # ✅ HTML NEWS PAGE
-        else:
+        # ✅ HTML NEWS PAGE (consumer.vic.gov.au/latest-news)
+        elif "consumer.vic.gov.au/latest-news" in url:
+            log("📡 Parsing Consumer Affairs HTML news page...")
             src = "CONSUMER-VIC"
+            
+            # Find all news articles - look for article containers or news items
+            # Based on screenshot structure: articles with titles, categories, dates
+            articles = soup.find_all('article') or soup.find_all('div', class_=lambda c: c and any(x in str(c).lower() for x in ['news', 'article', 'item', 'teaser']))
+            
+            for article in articles:
+                # Try to find title link
+                title_link = article.find('a', href=True)
+                if not title_link:
+                    title_link = article.find(['h2', 'h3', 'h4'], class_=lambda c: c and any(x in str(c).lower() for x in ['title', 'heading']))
+                    if title_link:
+                        href_tag = title_link.find('a', href=True)
+                        if href_tag:
+                            title_link = href_tag
+                
+                if title_link:
+                    title = title_link.get_text().strip()
+                    href = title_link.get('href', '') if hasattr(title_link, 'get') else title_link.get('href', '')
+                    full_url = clean_url(href, base) if href else url
+                    
+                    # Try to find date
+                    date_elem = article.find(['time', 'span'], class_=lambda c: c and 'date' in str(c).lower() if c else False)
+                    date_text = ""
+                    if date_elem:
+                        date_text = f" ({date_elem.get_text().strip()})"
+                    
+                    # Try to find description/summary
+                    desc_elem = article.find(['p', 'div'], class_=lambda c: c and any(x in str(c).lower() for x in ['description', 'summary', 'teaser', 'intro']) if c else False)
+                    desc_text = ""
+                    if desc_elem:
+                        desc_text = desc_elem.get_text().strip()[:150]
+                    
+                    if title and 20 < len(title) < 300 and full_url.startswith('http'):
+                        item_text = f"📰 [{src}] {title}{date_text}"
+                        if desc_text:
+                            item_text += f"\n   {desc_text}"
+                        item_text += f"\n🔗 {full_url}"
+                        items.append(item_text)
+                        if len(items) >= MAX_ITEMS: break
+            
+            # Fallback: Grab all links that look like news articles
+            if len(items) < MAX_ITEMS:
+                for link in soup.find_all('a', href=True):
+                    title = link.get_text().strip()
+                    href = link.get('href', '')
+                    # Check if it looks like a news article (has meaningful text, not nav/menu)
+                    if title and 30 < len(title) < 300 and not any(skip in title.lower() for skip in ['menu', 'home', 'contact', 'about', 'back to', 'filter', 'share', 'listen']):
+                        full_url = clean_url(href, base) if href else url
+                        if full_url.startswith('http') and 'consumer.vic.gov.au' in full_url:
+                            items.append(f"📰 [{src}] {title}\n🔗 {full_url}")
+                            if len(items) >= MAX_ITEMS: break
+            
+            log(f"✅ HTML {src}: {len(items)} items")
+        
+        # ✅ OTHER HTML PAGES (generic fallback)
+        else:
+            src = url.split('/')[2].replace('www.','').upper()
+            log(f"📡 Parsing generic HTML for {src}...")
+            
             for art in soup.find_all('article') or soup.find_all('div', class_=lambda c: c and 'news' in str(c).lower()):
                 lk, tt = art.find('a', href=True), art.find(['h2','h3','h4'], class_=lambda c: c and any(x in str(c).lower() for x in ['title','heading','news']))
                 if lk and tt:
@@ -91,6 +151,7 @@ def scrape_with_links(url):
                     if 30 < len(txt) < 300:
                         items.append(f"📰 [{src}] {txt}\n🔗 {full}")
                         if len(items) >= MAX_ITEMS: break
+            
             if len(items) < MAX_ITEMS:
                 for lk in soup.find_all('a', href=True):
                     txt, href = lk.get_text().strip(), lk['href']
@@ -110,6 +171,8 @@ def scrape_with_links(url):
         return f"🌐 {url}\n⏰ Timeout"
     except Exception as e:
         log(f"❌ ERROR {url[:60]}...: {type(e).__name__}: {e}")
+        import traceback
+        log(traceback.format_exc())
         return f"🌐 {url}\n❌ {type(e).__name__}"
 
 def call_ai(text):
@@ -118,13 +181,13 @@ def call_ai(text):
         url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/meta/llama-3-8b-instruct"
         headers = {"Authorization": f"Bearer {CF_TOKEN}", "Content-Type": "application/json"}
         prompt = f"""Consumer Affairs Victoria news. Scams, warnings, court actions, legislation, compliance only.
-Rules: 1) 🔗 link EVERY item 2) Source labels [NEWSALERTS],[MEDIARELEASES],[COURTACTIONS],[WARNINGS],[LEGISLATION] 3) Group by source type 4) Bullets+emojis 5) Max 500 words
+Rules: 1) 🔗 link EVERY item 2) Source labels [NEWSALERTS],[MEDIARELEASES],[COURTACTIONS],[WARNINGS],[LEGISLATION],[CONSUMER-VIC] 3) Group by source type 4) Bullets+emojis 5) Max 500 words
 News:
 {text[:8000]}
 Format:
 ⚠️ <b>Public Warnings</b>
 • 📋 [Summary] 🔗 [URL]
- <b>News & Media</b>
+📰 <b>News & Media</b>
 • 📋 [NEWSALERTS] Summary 🔗 [URL]
 ⚖️ <b>Court & Enforcement</b>
 • 📋 [COURTACTIONS] Summary 🔗 [URL]
