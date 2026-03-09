@@ -1,4 +1,4 @@
-import os, requests, time, json, warnings, sys
+import os, requests, time, json, warnings, sys, re
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -9,11 +9,8 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CF_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 CF_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
 
-# ✅ TARGET_URLS - ALL SPACES REMOVED
 TARGET_URLS = [
-    # HTML News Page
     "https://www.consumer.vic.gov.au/latest-news",
-    # RSS Feeds (6 sources)
     "https://cms9.consumer.vic.gov.au/RSS.aspx?RssType=newsalerts",
     "https://cms9.consumer.vic.gov.au/RSS.aspx?RssType=mediareleases",
     "https://cms9.consumer.vic.gov.au/RSS.aspx?RssType=courtactions",
@@ -22,7 +19,7 @@ TARGET_URLS = [
     "https://cms9.consumer.vic.gov.au/RSS.aspx?RssType=publicwarnings",
 ]
 
-MAX_ITEMS = 10  # Per source
+MAX_ITEMS = 10
 
 def log(msg): 
     print(f"📝 [LOG] {msg}")
@@ -37,7 +34,7 @@ def send_telegram(text, reply_id=None):
         data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
         if reply_id: data["reply_to_message_id"] = reply_id
         r = requests.post(url, json=data, timeout=30)
-        log(f"✅ Telegram: {r.status_code} - {r.text[:100]}")
+        log(f"✅ Telegram: {r.status_code}")
         return r.json()
     except Exception as e:
         log(f"❌ TELEGRAM FAILED: {type(e).__name__}: {e}")
@@ -45,10 +42,23 @@ def send_telegram(text, reply_id=None):
 
 def clean_url(href, base):
     if not href: return base
-    href = href.strip().split()[0]  # ✅ Remove spaces
+    href = href.strip().split()[0]
     if href.startswith(('http://','https://')): return href
     if href.startswith('//'): return f"https:{href}"
     return f"{base}{href}" if href.startswith('/') else f"{base}/{href}"
+
+def remove_duplicates(items):
+    """Remove duplicate items based on title similarity"""
+    seen = set()
+    unique = []
+    for item in items:
+        title = item.split('🔗')[0].lower().strip()
+        title_words = set(title.replace(' - ', ' ').replace(' | ', ' ').split())
+        title_key = ' '.join(sorted(title_words))
+        if title_key not in seen:
+            seen.add(title_key)
+            unique.append(item)
+    return unique
 
 def scrape_with_links(url):
     start = time.time()
@@ -80,99 +90,58 @@ def scrape_with_links(url):
                         if len(items) >= MAX_ITEMS: break
             log(f"✅ RSS {src}: {len(items)} items")
         
-        # ✅ HTML NEWS PAGE (consumer.vic.gov.au/latest-news)
+        # ✅ HTML NEWS PAGE
         elif "consumer.vic.gov.au/latest-news" in url:
-            log("📡 Parsing Consumer Affairs HTML news page...")
+            log("📡 Parsing Consumer Affairs HTML...")
             src = "CONSUMER-VIC"
-            
-            # Find all news articles - look for article containers or news items
-            # Based on screenshot structure: articles with titles, categories, dates
             articles = soup.find_all('article') or soup.find_all('div', class_=lambda c: c and any(x in str(c).lower() for x in ['news', 'article', 'item', 'teaser']))
             
             for article in articles:
-                # Try to find title link
                 title_link = article.find('a', href=True)
                 if not title_link:
-                    title_link = article.find(['h2', 'h3', 'h4'], class_=lambda c: c and any(x in str(c).lower() for x in ['title', 'heading']))
-                    if title_link:
-                        href_tag = title_link.find('a', href=True)
-                        if href_tag:
-                            title_link = href_tag
-                
+                    title_link = article.find(['h2', 'h3', 'h4'])
                 if title_link:
                     title = title_link.get_text().strip()
-                    href = title_link.get('href', '') if hasattr(title_link, 'get') else title_link.get('href', '')
+                    href = title_link.get('href', '') if hasattr(title_link, 'get') else ''
                     full_url = clean_url(href, base) if href else url
-                    
-                    # Try to find date
-                    date_elem = article.find(['time', 'span'], class_=lambda c: c and 'date' in str(c).lower() if c else False)
-                    date_text = ""
-                    if date_elem:
-                        date_text = f" ({date_elem.get_text().strip()})"
-                    
-                    # Try to find description/summary
-                    desc_elem = article.find(['p', 'div'], class_=lambda c: c and any(x in str(c).lower() for x in ['description', 'summary', 'teaser', 'intro']) if c else False)
-                    desc_text = ""
-                    if desc_elem:
-                        desc_text = desc_elem.get_text().strip()[:150]
-                    
                     if title and 20 < len(title) < 300 and full_url.startswith('http'):
-                        item_text = f"📰 [{src}] {title}{date_text}"
-                        if desc_text:
-                            item_text += f"\n   {desc_text}"
-                        item_text += f"\n🔗 {full_url}"
-                        items.append(item_text)
+                        items.append(f"📰 [{src}] {title}\n🔗 {full_url}")
                         if len(items) >= MAX_ITEMS: break
             
-            # Fallback: Grab all links that look like news articles
             if len(items) < MAX_ITEMS:
                 for link in soup.find_all('a', href=True):
                     title = link.get_text().strip()
                     href = link.get('href', '')
-                    # Check if it looks like a news article (has meaningful text, not nav/menu)
-                    if title and 30 < len(title) < 300 and not any(skip in title.lower() for skip in ['menu', 'home', 'contact', 'about', 'back to', 'filter', 'share', 'listen']):
+                    if title and 30 < len(title) < 300 and not any(s in title.lower() for s in ['menu', 'home', 'contact', 'about', 'back to', 'filter', 'share']):
                         full_url = clean_url(href, base) if href else url
                         if full_url.startswith('http') and 'consumer.vic.gov.au' in full_url:
                             items.append(f"📰 [{src}] {title}\n🔗 {full_url}")
                             if len(items) >= MAX_ITEMS: break
-            
             log(f"✅ HTML {src}: {len(items)} items")
         
-        # ✅ OTHER HTML PAGES (generic fallback)
         else:
             src = url.split('/')[2].replace('www.','').upper()
-            log(f"📡 Parsing generic HTML for {src}...")
-            
             for art in soup.find_all('article') or soup.find_all('div', class_=lambda c: c and 'news' in str(c).lower()):
-                lk, tt = art.find('a', href=True), art.find(['h2','h3','h4'], class_=lambda c: c and any(x in str(c).lower() for x in ['title','heading','news']))
+                lk, tt = art.find('a', href=True), art.find(['h2','h3','h4'])
                 if lk and tt:
                     txt, href = tt.get_text().strip(), lk['href']
                     full = clean_url(href, base)
                     if 30 < len(txt) < 300:
                         items.append(f"📰 [{src}] {txt}\n🔗 {full}")
                         if len(items) >= MAX_ITEMS: break
-            
-            if len(items) < MAX_ITEMS:
-                for lk in soup.find_all('a', href=True):
-                    txt, href = lk.get_text().strip(), lk['href']
-                    full = clean_url(href, base)
-                    if txt and 30 < len(txt) < 300 and full.startswith('http'):
-                        if any(s in txt.lower() for s in ['home','contact','about','privacy','menu','skip']): continue
-                        items.append(f"📰 [{src}] {txt}\n🔗 {full}")
-                        if len(items) >= MAX_ITEMS: break
             log(f"✅ HTML {src}: {len(items)} items")
         
-        result = f"🌐 {url}\n✅ {len(items)}\n\n" + "\n\n".join(items[:MAX_ITEMS]) if items else f"🌐 {url}\n⚠️ None"
-        log(f"✅ DONE: {url[:50]}... ({len(items)} items)")
-        return result
+        # ✅ Remove duplicates before returning
+        if items:
+            items = remove_duplicates(items)
+            return f"🌐 {url}\n✅ {len(items)}\n\n" + "\n\n".join(items[:MAX_ITEMS])
+        return f"🌐 {url}\n⚠️ None"
         
     except requests.exceptions.Timeout:
         log(f"❌ TIMEOUT: {url[:60]}...")
         return f"🌐 {url}\n⏰ Timeout"
     except Exception as e:
         log(f"❌ ERROR {url[:60]}...: {type(e).__name__}: {e}")
-        import traceback
-        log(traceback.format_exc())
         return f"🌐 {url}\n❌ {type(e).__name__}"
 
 def call_ai(text):
@@ -180,25 +149,49 @@ def call_ai(text):
     try:
         url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/meta/llama-3-8b-instruct"
         headers = {"Authorization": f"Bearer {CF_TOKEN}", "Content-Type": "application/json"}
-        prompt = f"""Consumer Affairs Victoria news. Scams, warnings, court actions, legislation, compliance only.
-Rules: 1) 🔗 link EVERY item 2) Source labels [NEWSALERTS],[MEDIARELEASES],[COURTACTIONS],[WARNINGS],[LEGISLATION],[CONSUMER-VIC] 3) Group by source type 4) Bullets+emojis 5) Max 500 words
+        
+        # ✅ STRICT PROMPT - No filler, HTML only, no markdown
+        prompt = f"""Consumer Affairs Victoria news. Scams, warnings, court actions, legislation.
+RULES:
+- Use Telegram HTML: <b>bold</b> NOT **bold**
+- Include 🔗 link for EVERY item
+- Source labels: [NEWSALERTS],[MEDIARELEASES],[COURTACTIONS],[WARNINGS],[LEGISLATION],[CONSUMER-VIC]
+- Group by source type
+- Bullet points with emojis
+- Max 400 words
+- NO introductory text like "Here is..."
+- NO markdown formatting (**, `, ```)
+- Remove duplicates
+
 News:
 {text[:8000]}
-Format:
+
+FORMAT EXACTLY:
 ⚠️ <b>Public Warnings</b>
 • 📋 [Summary] 🔗 [URL]
+
 📰 <b>News & Media</b>
 • 📋 [NEWSALERTS] Summary 🔗 [URL]
+
 ⚖️ <b>Court & Enforcement</b>
 • 📋 [COURTACTIONS] Summary 🔗 [URL]
+
 📜 <b>Legislation</b>
 • 📋 Summary 🔗 [URL]"""
         
         log("📡 Posting to Cloudflare AI...")
-        r = requests.post(url, headers=headers, json={"messages": [{"role": "user", "content": prompt}], "max_tokens": 1200}, timeout=30)
+        r = requests.post(url, headers=headers, json={"messages": [{"role": "user", "content": prompt}], "max_tokens": 1000}, timeout=30)
         log(f"✅ AI response: {r.status_code}")
         r.raise_for_status()
         result = r.json()['result']['response'].strip()
+        
+        # ✅ Post-process: Remove any markdown AI might add
+        result = result.replace('**', '').replace('`', '').replace('```', '')
+        # Remove filler phrases
+        for phrase in ['Here is', 'here is', 'Below is', 'Following is', 'I have']:
+            if result.startswith(phrase):
+                result = result.split('\n\n', 1)[-1] if '\n\n' in result else result
+        
         log(f"✅ AI completed ({len(result)} chars)")
         return result
     except Exception as e:
