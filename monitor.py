@@ -67,4 +67,4 @@ def clean_url(href, base):
     href = href.strip().split()[0]
     if href.startswith(('http://','https://')): return href
     if href.startswith('//'): return f"https:{href}"
-    return f"{base}{href}" if href.startswith('/') else f"{base}/{href
+    return f"{base}{href}" if href.startswith('/') else f"{base}/{href}"
